@@ -9,5 +9,9 @@
     "better-sqlite3": "^11.10.0",
     "croner": "^9.0.0",
     "e2b": "^2.27.0"
+  },
+  "optionalDependencies": {
+    "@alibaba-group/opensandbox": "^0.1.8",
+    "@daytona/sdk": "*"
   }
 }
