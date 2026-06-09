@@ -126,6 +126,13 @@ WORKDIR /codex
 COPY harnesses/codex/package.json ./package.json
 RUN npm install --omit=dev --no-audit --no-fund
 
+# ================================================================= hermes install
+# hermes-agent is a Python CLI tool. Install via uv into a dedicated venv so it
+# doesn't pollute the system Python and the binary lands at a predictable path.
+FROM python:3.12-slim AS hermes-deps
+RUN pip install --no-cache-dir uv \
+ && uv pip install --system --no-cache hermes-agent
+
 # ===================================================================== UI build
 # Next.js static export — produces ui/out/. Lockfile-first so the dep-install
 # layer caches; source-copy is a separate layer so edits to ui/src don't blow
@@ -159,6 +166,14 @@ COPY --from=cc-deps    --chown=sandbox:sandbox /cc/node_modules      /opt/lap/cl
 COPY --from=codex-deps --chown=sandbox:sandbox /codex/node_modules  /opt/lap/codex/node_modules
 ENV PATH="/opt/lap/codex/node_modules/.bin:${PATH}"
 # github-copilot harness uses native fetch — no separate node_modules stage needed
+
+# hermes-agent: copy Python runtime + installed packages from the hermes-deps stage.
+# The slim Python image puts the interpreter at /usr/local/bin/python3 and user-installed
+# scripts at /usr/local/bin/hermes. Copy both so `hermes` is on PATH.
+COPY --from=hermes-deps /usr/local/lib/python3.12 /usr/local/lib/python3.12
+COPY --from=hermes-deps /usr/local/bin/python3.12 /usr/local/bin/python3.12
+COPY --from=hermes-deps /usr/local/bin/hermes /usr/local/bin/hermes
+RUN ln -sf /usr/local/bin/python3.12 /usr/local/bin/python3
 
 COPY --chown=sandbox:sandbox harnesses/inline-adapter.mjs /opt/lap/inline-adapter.mjs
 COPY --chown=sandbox:sandbox harnesses/harness-sdk.mjs /opt/lap/harness-sdk.mjs

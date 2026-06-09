@@ -1,11 +1,11 @@
 /**
- * Session store — SQLite persistence for cc/copilot/codex/opencode sessions.
+ * Session store — SQLite persistence for cc/copilot/codex/hermes/opencode sessions.
  *
  * Schema (tables created by loop-store.mjs initDb):
  *
  *   sessions (
  *     id             TEXT PRIMARY KEY,
- *     harness        TEXT NOT NULL,     -- "cc" | "github-copilot" | "codex" | "opencode"
+ *     harness        TEXT NOT NULL,     -- "cc" | "github-copilot" | "codex" | "hermes" | "opencode"
  *     agent_id       TEXT,              -- platform agent id for agent-run sessions
  *     title          TEXT NOT NULL,
  *     created_at     INTEGER NOT NULL,
@@ -211,10 +211,10 @@ export function loadOcSessions() {
  *
  * Opencode sessions are handled separately via loadOcSessions() + ocSidRemap.
  *
- * @returns {{ cc: Map, copilot: Map, codex: Map }}
+ * @returns {{ cc: Map, copilot: Map, codex: Map, hermes: Map }}
  */
 export function hydrateFromDb() {
-  const empty = { cc: new Map(), copilot: new Map(), codex: new Map() };
+  const empty = { cc: new Map(), copilot: new Map(), codex: new Map(), hermes: new Map() };
   try {
     const db = getDb();
     const rows = db.prepare(`SELECT * FROM sessions ORDER BY created_at ASC`).all();
@@ -246,6 +246,8 @@ export function hydrateFromDb() {
         empty.copilot.set(row.id, base);
       } else if (row.harness === "codex") {
         empty.codex.set(row.id, { ...base, activeProcess: null });
+      } else if (row.harness === "hermes") {
+        empty.hermes.set(row.id, { ...base, activeProcess: null });
       }
     }
     return empty;
