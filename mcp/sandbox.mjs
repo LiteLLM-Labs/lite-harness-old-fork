@@ -1,5 +1,5 @@
 /**
- * Sandbox tools — E2B and Daytona providers, platform-mode delegation.
+ * Sandbox tools — E2B, Daytona, and OpenSandbox providers, platform-mode delegation.
  *
  * Shared between the platform MCP (all harnesses get it via PLATFORM_MCP_URL)
  * and the opencode stdio MCP (harnesses/opencode/sandbox-mcp.mjs, which is now
@@ -22,6 +22,30 @@ async function importE2b() {
     if (e?.code !== "ERR_MODULE_NOT_FOUND") throw e;
     return requireFromHarnesses("e2b");
   }
+}
+
+async function importOpenSandbox() {
+  try {
+    return await import("@alibaba-group/opensandbox");
+  } catch (e) {
+    if (e?.code !== "ERR_MODULE_NOT_FOUND") throw e;
+    try {
+      return requireFromHarnesses("@alibaba-group/opensandbox");
+    } catch {
+      throw new Error(
+        "@alibaba-group/opensandbox not installed. Run: npm install @alibaba-group/opensandbox\n" +
+        "Note: OpenSandbox is an optional dependency not included in the Docker image.",
+      );
+    }
+  }
+}
+
+/** Merge OpenSandbox execution logs (stdout[] + stderr[]) into a single string. */
+export function extractOpenSandboxOutput(logs) {
+  if (!logs) return "";
+  const stdout = (logs.stdout ?? []).map((m) => m.text).join("");
+  const stderr = (logs.stderr ?? []).map((m) => m.text).join("");
+  return stdout + stderr;
 }
 
 export const SANDBOX_TIMEOUT_MS = 1_800_000; // 30 min idle keepalive
@@ -220,6 +244,118 @@ export class DaytonaProvider extends SandboxProvider {
   }
 }
 
+// ── OpenSandbox provider ──────────────────────────────────────────────────────
+
+export class OpenSandboxProvider extends SandboxProvider {
+  get providerName() { return "opensandbox"; }
+
+  constructor(apiUrl, image, apiKey, { vaultUrl, vaultProxyToken } = {}) {
+    super();
+    this._apiUrl          = apiUrl;
+    this._image           = image || "default";
+    this._apiKey          = apiKey; // optional; omit for in-cluster RBAC auth
+    this._vaultUrl        = vaultUrl;
+    this._vaultProxyToken = vaultProxyToken;
+  }
+
+  _connConfig() {
+    const opts = { domain: this._apiUrl, useServerProxy: true };
+    if (this._apiKey) opts.apiKey = this._apiKey;
+    return opts;
+  }
+
+  _buildEnvs() {
+    const envs = {};
+    if (this._vaultUrl) {
+      try {
+        const u = new URL(this._vaultUrl);
+        if (this._vaultProxyToken) { u.username = "x"; u.password = this._vaultProxyToken; }
+        envs.HTTPS_PROXY = u.toString();
+        envs.HTTP_PROXY  = u.toString();
+      } catch {}
+    }
+    return envs;
+  }
+
+  async create(_name, getVaultEnvs) {
+    const { Sandbox } = await importOpenSandbox();
+    const vaultEnvs = getVaultEnvs ? await getVaultEnvs() : {};
+    const sb = await Sandbox.create({
+      connectionConfig: this._connConfig(),
+      image: this._image,
+      env: { ...this._buildEnvs(), ...vaultEnvs },
+    });
+    return { id: sb.id, display: `opensandbox:${sb.id} (${this._image})` };
+  }
+
+  async execute(id, cmd) {
+    const { Sandbox } = await importOpenSandbox();
+    const sandbox = await Sandbox.connect({ connectionConfig: this._connConfig(), sandboxId: id });
+    await sandbox.renew(Math.ceil(SANDBOX_TIMEOUT_MS / 1000));
+    let result;
+    try {
+      result = await sandbox.commands.run(cmd, { timeoutSeconds: Math.ceil(EXECUTE_TIMEOUT_MS / 1000) });
+    } catch (e) {
+      const out = extractOpenSandboxOutput(e.logs);
+      if (out) return `${out}\n[exit 1]`;
+      throw e;
+    } finally {
+      await sandbox.close().catch(() => {});
+    }
+    const out = extractOpenSandboxOutput(result.logs);
+    const exitCode = result.exitCode ?? 0;
+    return exitCode !== 0 ? `${out}\n[exit ${exitCode}]` : out;
+  }
+
+  async readFile(id, path) {
+    const { Sandbox } = await importOpenSandbox();
+    const sandbox = await Sandbox.connect({ connectionConfig: this._connConfig(), sandboxId: id });
+    await sandbox.renew(Math.ceil(SANDBOX_TIMEOUT_MS / 1000));
+    try {
+      return await sandbox.files.readFile(path);
+    } finally {
+      await sandbox.close().catch(() => {});
+    }
+  }
+
+  async readBase64(id, path) {
+    const { Sandbox } = await importOpenSandbox();
+    const sandbox = await Sandbox.connect({ connectionConfig: this._connConfig(), sandboxId: id });
+    await sandbox.renew(Math.ceil(SANDBOX_TIMEOUT_MS / 1000));
+    try {
+      const bytes = await sandbox.files.readBytes(path);
+      return Buffer.from(bytes).toString("base64");
+    } finally {
+      await sandbox.close().catch(() => {});
+    }
+  }
+
+  async writeFile(id, path, content) {
+    const { Sandbox } = await importOpenSandbox();
+    const sandbox = await Sandbox.connect({ connectionConfig: this._connConfig(), sandboxId: id });
+    await sandbox.renew(Math.ceil(SANDBOX_TIMEOUT_MS / 1000));
+    try {
+      await sandbox.files.writeFiles([{ path, data: content }]);
+    } finally {
+      await sandbox.close().catch(() => {});
+    }
+  }
+
+  async terminate(id) {
+    const { Sandbox } = await importOpenSandbox();
+    const sandbox = await Sandbox.connect({
+      connectionConfig: this._connConfig(),
+      sandboxId: id,
+      skipHealthCheck: true,
+    });
+    try {
+      await sandbox.kill();
+    } finally {
+      await sandbox.close().catch(() => {});
+    }
+  }
+}
+
 // ── Provider factory ──────────────────────────────────────────────────────────
 
 /**
@@ -231,6 +367,7 @@ export function buildProvider(config = {}) {
     sandboxProvider = "",
     e2bApiKey, e2bTemplate = "base",
     daytonaApiKey, daytonaApiUrl, daytonaSnapshot, daytonaImage,
+    opensandboxApiUrl, opensandboxImage, opensandboxApiKey,
     vaultUrl, vaultProxyToken,
   } = config;
 
@@ -244,11 +381,16 @@ export function buildProvider(config = {}) {
     if (!daytonaApiKey) return { error: "DAYTONA_API_KEY not set" };
     return { provider: new DaytonaProvider(daytonaApiKey, daytonaApiUrl, daytonaSnapshot, daytonaImage, { vaultUrl, vaultProxyToken }) };
   }
+  if (prov === "opensandbox" || (!prov && opensandboxApiUrl)) {
+    if (!opensandboxApiUrl) return { error: "OPENSANDBOX_API_URL not set" };
+    return { provider: new OpenSandboxProvider(opensandboxApiUrl, opensandboxImage, opensandboxApiKey, { vaultUrl, vaultProxyToken }) };
+  }
   return {
     error:
       "No sandbox provider configured. Set one of:\n" +
-      "  E2B_API_KEY      — use E2B (optionally SANDBOX_PROVIDER=e2b)\n" +
-      "  DAYTONA_API_KEY  — use Daytona (optionally SANDBOX_PROVIDER=daytona)\n" +
+      "  E2B_API_KEY         — use E2B (optionally SANDBOX_PROVIDER=e2b)\n" +
+      "  DAYTONA_API_KEY     — use Daytona (optionally SANDBOX_PROVIDER=daytona)\n" +
+      "  OPENSANDBOX_API_URL — use OpenSandbox (optionally SANDBOX_PROVIDER=opensandbox)\n" +
       "Or enable platform mode with LAP_PLATFORM_MODE=1.",
   };
 }
@@ -267,6 +409,9 @@ export function readEnvConfig() {
     daytonaApiUrl:    process.env.DAYTONA_API_URL,
     daytonaSnapshot:  process.env.DAYTONA_SNAPSHOT,
     daytonaImage:     process.env.DAYTONA_IMAGE,
+    opensandboxApiUrl: process.env.OPENSANDBOX_API_URL,
+    opensandboxImage:  process.env.OPENSANDBOX_IMAGE,
+    opensandboxApiKey: process.env.OPENSANDBOX_API_KEY,
     vaultUrl:         process.env.VAULT_URL,
     vaultProxyToken:  process.env.VAULT_PROXY_TOKEN,
     sandboxProvider:  (process.env.SANDBOX_PROVIDER || "").toLowerCase(),
@@ -288,7 +433,7 @@ export const SANDBOX_TOOL_DEFINITIONS = [
   {
     name: "sandbox_provision",
     description:
-      "Provision a new sandbox environment (E2B or Daytona). Returns a confirmation when ready. " +
+      "Provision a new sandbox environment (E2B, Daytona, or OpenSandbox). Returns a confirmation when ready. " +
       "In platform mode (LAP_PLATFORM_MODE=1), pass session_id — find it in the " +
       "<lap_session_id> tag in your context. In direct mode, session_id is ignored.",
     inputSchema: {
@@ -588,7 +733,7 @@ function getSingleton() {
 export function registerSandboxTools(registerTool) {
   const config = readEnvConfig();
   const sandboxAvailable =
-    config.platformMode || config.e2bApiKey || config.daytonaApiKey;
+    config.platformMode || config.e2bApiKey || config.daytonaApiKey || config.opensandboxApiUrl;
 
   if (!sandboxAvailable) return;
 

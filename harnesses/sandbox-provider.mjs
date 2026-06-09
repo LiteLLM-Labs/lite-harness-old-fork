@@ -5,11 +5,13 @@
  *   SANDBOX_TIMEOUT_MS  — idle keepalive timeout (30 min)
  *   EXECUTE_TIMEOUT_MS  — per-command timeout (3 min)
  *   SandboxProvider     — abstract base class
- *   E2bProvider         — E2B concrete provider
- *   DaytonaProvider     — Daytona concrete provider
- *   buildDirectProvider — factory that reads env vars and returns { provider } or { error }
+ *   E2bProvider            — E2B concrete provider
+ *   DaytonaProvider        — Daytona concrete provider
+ *   OpenSandboxProvider    — OpenSandbox (Alibaba) concrete provider
+ *   buildDirectProvider    — factory that reads env vars and returns { provider } or { error }
  *
- * No static imports — "e2b" and "@daytona/sdk" are imported dynamically inside async methods.
+ * No static imports — "e2b", "@daytona/sdk", and "@alibaba-group/opensandbox" are imported
+ * dynamically inside async methods.
  */
 
 export const SANDBOX_TIMEOUT_MS = 1_800_000; // 30 min idle keepalive
@@ -212,15 +214,138 @@ export class DaytonaProvider extends SandboxProvider {
   }
 }
 
+// ── OpenSandbox provider ──────────────────────────────────────────────────────
+export class OpenSandboxProvider extends SandboxProvider {
+  get providerName() { return "opensandbox"; }
+
+  constructor(apiUrl, image, apiKey) {
+    super();
+    this._apiUrl = apiUrl;
+    this._image  = image || "default";
+    this._apiKey = apiKey; // optional; omit for in-cluster RBAC auth
+  }
+
+  _connConfig() {
+    const opts = { domain: this._apiUrl, useServerProxy: true };
+    if (this._apiKey) opts.apiKey = this._apiKey;
+    return opts;
+  }
+
+  async _import() {
+    try {
+      return await import("@alibaba-group/opensandbox");
+    } catch {
+      throw new Error(
+        "@alibaba-group/opensandbox not installed. Run: npm install @alibaba-group/opensandbox\n" +
+        "Note: OpenSandbox is an optional dependency not included in the Docker image.",
+      );
+    }
+  }
+
+  async create(_name) {
+    const { Sandbox } = await this._import();
+    const sb = await Sandbox.create({
+      connectionConfig: this._connConfig(),
+      image: this._image,
+    });
+    return { id: sb.id, display: `opensandbox:${sb.id} (${this._image})` };
+  }
+
+  async _connect() {
+    // Returns (id) => Promise<Sandbox>
+    const { Sandbox } = await this._import();
+    return (id) => Sandbox.connect({ connectionConfig: this._connConfig(), sandboxId: id });
+  }
+
+  async execute(id, cmd) {
+    const { Sandbox } = await this._import();
+    const sandbox = await Sandbox.connect({ connectionConfig: this._connConfig(), sandboxId: id });
+    await sandbox.renew(Math.ceil(SANDBOX_TIMEOUT_MS / 1000));
+    let result;
+    try {
+      result = await sandbox.commands.run(cmd, {
+        timeoutSeconds: Math.ceil(EXECUTE_TIMEOUT_MS / 1000),
+      });
+    } catch (e) {
+      const out = _extractOutput(e.logs);
+      if (out) return `${out}\n[exit 1]`;
+      throw e;
+    } finally {
+      await sandbox.close().catch(() => {});
+    }
+    const out = _extractOutput(result.logs);
+    const exitCode = result.exitCode ?? 0;
+    return exitCode !== 0 ? `${out}\n[exit ${exitCode}]` : out;
+  }
+
+  async readFile(id, path) {
+    const { Sandbox } = await this._import();
+    const sandbox = await Sandbox.connect({ connectionConfig: this._connConfig(), sandboxId: id });
+    await sandbox.renew(Math.ceil(SANDBOX_TIMEOUT_MS / 1000));
+    try {
+      return await sandbox.files.readFile(path);
+    } finally {
+      await sandbox.close().catch(() => {});
+    }
+  }
+
+  async readBase64(id, path) {
+    const { Sandbox } = await this._import();
+    const sandbox = await Sandbox.connect({ connectionConfig: this._connConfig(), sandboxId: id });
+    await sandbox.renew(Math.ceil(SANDBOX_TIMEOUT_MS / 1000));
+    try {
+      const bytes = await sandbox.files.readBytes(path);
+      return Buffer.from(bytes).toString("base64");
+    } finally {
+      await sandbox.close().catch(() => {});
+    }
+  }
+
+  async writeFile(id, path, content) {
+    const { Sandbox } = await this._import();
+    const sandbox = await Sandbox.connect({ connectionConfig: this._connConfig(), sandboxId: id });
+    await sandbox.renew(Math.ceil(SANDBOX_TIMEOUT_MS / 1000));
+    try {
+      await sandbox.files.writeFiles([{ path, data: content }]);
+    } finally {
+      await sandbox.close().catch(() => {});
+    }
+  }
+
+  async terminate(id) {
+    const { Sandbox } = await this._import();
+    const sandbox = await Sandbox.connect({
+      connectionConfig: this._connConfig(),
+      sandboxId: id,
+      skipHealthCheck: true,
+    });
+    try {
+      await sandbox.kill();
+    } finally {
+      await sandbox.close().catch(() => {});
+    }
+  }
+}
+
+function _extractOutput(logs) {
+  if (!logs) return "";
+  const stdout = (logs.stdout ?? []).map((m) => m.text).join("");
+  const stderr = (logs.stderr ?? []).map((m) => m.text).join("");
+  return stdout + stderr;
+}
+
 // ── Provider factory ──────────────────────────────────────────────────────────
 export function buildDirectProvider() {
-  const E2B_API_KEY      = process.env.E2B_API_KEY;
-  const E2B_TEMPLATE     = process.env.E2B_TEMPLATE || "base";
-  const DAYTONA_API_KEY  = process.env.DAYTONA_API_KEY;
-  const DAYTONA_API_URL  = process.env.DAYTONA_API_URL;
-  const DAYTONA_SNAPSHOT = process.env.DAYTONA_SNAPSHOT;
-  const DAYTONA_IMAGE    = process.env.DAYTONA_IMAGE;
-  const SANDBOX_PROVIDER_ENV = (process.env.SANDBOX_PROVIDER || "").toLowerCase();
+  const E2B_API_KEY           = process.env.E2B_API_KEY;
+  const E2B_TEMPLATE          = process.env.E2B_TEMPLATE || "base";
+  const DAYTONA_API_KEY       = process.env.DAYTONA_API_KEY;
+  const DAYTONA_API_URL       = process.env.DAYTONA_API_URL;
+  const DAYTONA_SNAPSHOT      = process.env.DAYTONA_SNAPSHOT;
+  const DAYTONA_IMAGE         = process.env.DAYTONA_IMAGE;
+  const OPENSANDBOX_API_URL   = process.env.OPENSANDBOX_API_URL;
+  const OPENSANDBOX_IMAGE     = process.env.OPENSANDBOX_IMAGE;
+  const OPENSANDBOX_API_KEY   = process.env.OPENSANDBOX_API_KEY;
+  const SANDBOX_PROVIDER_ENV  = (process.env.SANDBOX_PROVIDER || "").toLowerCase();
 
   if (SANDBOX_PROVIDER_ENV === "e2b" || (!SANDBOX_PROVIDER_ENV && E2B_API_KEY)) {
     if (!E2B_API_KEY) return { error: "E2B_API_KEY not set" };
@@ -230,5 +355,9 @@ export function buildDirectProvider() {
     if (!DAYTONA_API_KEY) return { error: "DAYTONA_API_KEY not set" };
     return { provider: new DaytonaProvider(DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_SNAPSHOT, DAYTONA_IMAGE) };
   }
-  return { error: "No sandbox provider configured. Set E2B_API_KEY or DAYTONA_API_KEY." };
+  if (SANDBOX_PROVIDER_ENV === "opensandbox" || (!SANDBOX_PROVIDER_ENV && OPENSANDBOX_API_URL)) {
+    if (!OPENSANDBOX_API_URL) return { error: "OPENSANDBOX_API_URL not set" };
+    return { provider: new OpenSandboxProvider(OPENSANDBOX_API_URL, OPENSANDBOX_IMAGE, OPENSANDBOX_API_KEY) };
+  }
+  return { error: "No sandbox provider configured. Set E2B_API_KEY, DAYTONA_API_KEY, or OPENSANDBOX_API_URL." };
 }
