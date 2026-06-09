@@ -51,6 +51,7 @@ const BUILTIN_AGENTS: Record<string, string> = {
   cc: "Claude Code",
   "github-copilot": "GitHub Copilot",
   codex: "Codex",
+  hermes: "Hermes",
 };
 
 function agentPrompt(agent: Agent | null): string {
@@ -365,6 +366,7 @@ function ChatInner() {
                     <SelectItem value="opencode" className="text-xs font-mono">opencode</SelectItem>
                     <SelectItem value="claude-code" className="text-xs font-mono">claude code</SelectItem>
                     <SelectItem value="github-copilot" className="text-xs font-mono">github copilot</SelectItem>
+                    <SelectItem value="hermes" className="text-xs font-mono">hermes</SelectItem>
                     {savedAgents.length > 0 && (
                       <>
                         <div className="px-2 py-1.5 text-[10px] text-muted-foreground uppercase tracking-wider border-t mt-1 pt-2">Saved agents</div>
