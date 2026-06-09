@@ -38,7 +38,7 @@ The sandbox MCP is activated automatically when any of the following are set.
 
 ### Direct mode (default)
 
-The MCP provisions sandboxes directly from the harness process. Two providers are supported.
+The MCP provisions sandboxes directly from the harness process. Three providers are supported.
 
 **E2B**
 
@@ -56,11 +56,21 @@ The MCP provisions sandboxes directly from the harness process. Two providers ar
 | `DAYTONA_SNAPSHOT` | no | Snapshot to use when creating |
 | `DAYTONA_IMAGE` | no | Image to use instead of snapshot |
 
+**OpenSandbox**
+
+For self-hosted deployments (e.g. EKS with an in-cluster OpenSandbox controller). No API key needed when running inside the cluster — omit `OPENSANDBOX_API_KEY` and use Kubernetes RBAC instead.
+
+| Var | Required | What it is |
+|---|---|---|
+| `OPENSANDBOX_API_URL` | yes | OpenSandbox controller URL (e.g. `http://opensandbox-controller.opensandbox.svc:8080`) |
+| `OPENSANDBOX_IMAGE` | no | Container image for sandboxes (default: `default`) |
+| `OPENSANDBOX_API_KEY` | no | API key (omit for in-cluster RBAC auth) |
+
 **Provider selection**
 
 | Var | What it is |
 |---|---|
-| `SANDBOX_PROVIDER` | `e2b` or `daytona`. Auto-detects from whichever API key is present if unset. |
+| `SANDBOX_PROVIDER` | `e2b`, `daytona`, or `opensandbox`. Auto-detects from whichever key/URL is present if unset. |
 
 **Vault proxy (both providers)**
 

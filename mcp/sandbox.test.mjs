@@ -10,10 +10,12 @@ import {
   SandboxProvider,
   E2bProvider,
   DaytonaProvider,
+  OpenSandboxProvider,
   buildProvider,
   readEnvConfig,
   createState,
   createHandlers,
+  extractOpenSandboxOutput,
   SANDBOX_TOOL_DEFINITIONS,
   READ_FILE_MAX_BYTES,
 } from "./sandbox.mjs";
@@ -102,6 +104,82 @@ test("buildProvider returns error when no provider configured", () => {
 test("buildProvider returns error when SANDBOX_PROVIDER=e2b but no key", () => {
   const { error } = buildProvider({ sandboxProvider: "e2b" });
   assert.match(error, /E2B_API_KEY/);
+});
+
+// ── OpenSandbox ───────────────────────────────────────────────────────────────
+
+test("buildProvider returns OpenSandboxProvider when opensandboxApiUrl set", () => {
+  const { provider, error } = buildProvider({ opensandboxApiUrl: "http://localhost:8080" });
+  assert.ok(provider instanceof OpenSandboxProvider);
+  assert.equal(error, undefined);
+});
+
+test("buildProvider respects SANDBOX_PROVIDER=opensandbox override", () => {
+  const { provider } = buildProvider({
+    sandboxProvider: "opensandbox",
+    opensandboxApiUrl: "http://localhost:8080",
+    e2bApiKey: "e", daytonaApiKey: "d", // must be ignored
+  });
+  assert.ok(provider instanceof OpenSandboxProvider);
+});
+
+test("buildProvider returns error when SANDBOX_PROVIDER=opensandbox but no URL", () => {
+  const { error } = buildProvider({ sandboxProvider: "opensandbox" });
+  assert.match(error, /OPENSANDBOX_API_URL/);
+});
+
+test("buildProvider error message lists OpenSandbox when nothing configured", () => {
+  const { error } = buildProvider({});
+  assert.match(error, /OPENSANDBOX_API_URL/);
+});
+
+test("OpenSandboxProvider defaults image to 'default'", () => {
+  const p = new OpenSandboxProvider("http://localhost:8080");
+  assert.equal(p._image, "default");
+  assert.equal(p.providerName, "opensandbox");
+});
+
+test("OpenSandboxProvider connConfig enables server proxy, omits apiKey when unset", () => {
+  const p = new OpenSandboxProvider("http://ctrl:8080", "ubuntu:22.04");
+  const cc = p._connConfig();
+  assert.equal(cc.domain, "http://ctrl:8080");
+  assert.equal(cc.useServerProxy, true);
+  assert.equal("apiKey" in cc, false);
+});
+
+test("OpenSandboxProvider connConfig includes apiKey when set", () => {
+  const p = new OpenSandboxProvider("http://ctrl:8080", "img", "key-123");
+  assert.equal(p._connConfig().apiKey, "key-123");
+});
+
+test("OpenSandboxProvider injects vault proxy into envs", () => {
+  const p = new OpenSandboxProvider("http://ctrl:8080", "img", null, {
+    vaultUrl: "http://vault:9000", vaultProxyToken: "tok",
+  });
+  const envs = p._buildEnvs();
+  assert.match(envs.HTTPS_PROXY, /tok@vault:9000/);
+  assert.match(envs.HTTP_PROXY, /tok@vault:9000/);
+});
+
+// ── extractOpenSandboxOutput ──────────────────────────────────────────────────
+
+test("extractOpenSandboxOutput merges stdout then stderr", () => {
+  const logs = {
+    stdout: [{ text: "out1" }, { text: "out2" }],
+    stderr: [{ text: "err1" }],
+  };
+  assert.equal(extractOpenSandboxOutput(logs), "out1out2err1");
+});
+
+test("extractOpenSandboxOutput handles missing/empty logs", () => {
+  assert.equal(extractOpenSandboxOutput(undefined), "");
+  assert.equal(extractOpenSandboxOutput(null), "");
+  assert.equal(extractOpenSandboxOutput({}), "");
+  assert.equal(extractOpenSandboxOutput({ stdout: [], stderr: [] }), "");
+});
+
+test("extractOpenSandboxOutput tolerates only-stderr", () => {
+  assert.equal(extractOpenSandboxOutput({ stderr: [{ text: "boom" }] }), "boom");
 });
 
 test("readEnvConfig keeps LAP auth token separate from vault master key", () => {
