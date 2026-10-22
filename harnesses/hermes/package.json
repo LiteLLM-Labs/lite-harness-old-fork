@@ -1,0 +1,7 @@
+{
+  "name": "hermes-harness",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hermes Agent harness — routes through LiteLLM via Nous Research hermes-agent CLI (OpenAI-compatible endpoint).",
+  "dependencies": {}
+}

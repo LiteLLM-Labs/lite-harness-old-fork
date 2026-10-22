@@ -37,13 +37,14 @@
 /**
  * @typedef {Object} HarnessSDKOptions
  * @property {Map<string,string>}     sessionHarness    - sessionId → harness type
- *   ('cc' | 'opencode' | 'github-copilot' | 'codex').
+ *   ('cc' | 'opencode' | 'github-copilot' | 'codex' | 'hermes').
  *   In inline-adapter this is the existing `sessionAgent` Map — pass it by
  *   reference; the SDK reads it live so newly registered sessions are visible
  *   immediately without re-initialization.
  * @property {Map<string,{history: Array}>} ccSessions       - claude-code session store
  * @property {Map<string,{history: Array}>} copilotSessions  - github-copilot session store
  * @property {Map<string,{history: Array}>} codexSessions    - codex session store
+ * @property {Map<string,{history: Array}>} hermesSessions   - hermes session store
  * @property {(sessionId: string) => Promise<Array>} getOcMessages
  *   Async function that fetches messages for an opencode session from the
  *   child-process HTTP API.  Injected so harness-sdk.mjs has no import
@@ -54,11 +55,12 @@ export class HarnessSDK {
   /**
    * @param {HarnessSDKOptions} opts
    */
-  constructor({ sessionHarness, ccSessions, copilotSessions, codexSessions, getOcMessages }) {
+  constructor({ sessionHarness, ccSessions, copilotSessions, codexSessions, hermesSessions, getOcMessages }) {
     this._sessionHarness = sessionHarness;
     this._cc = ccSessions;
     this._copilot = copilotSessions;
     this._codex = codexSessions;
+    this._hermes = hermesSessions;
     this._getOcMessages = getOcMessages;
   }
 
@@ -66,7 +68,7 @@ export class HarnessSDK {
    * Return the harness type for a session, defaulting to 'opencode'.
    *
    * @param {string} sessionId
-   * @returns {'cc'|'opencode'|'github-copilot'|'codex'|string}
+   * @returns {'cc'|'opencode'|'github-copilot'|'codex'|'hermes'|string}
    */
   harnessFor(sessionId) {
     return this._sessionHarness.get(sessionId) ?? "opencode";
@@ -75,8 +77,8 @@ export class HarnessSDK {
   /**
    * Retrieve all messages for a session, regardless of harness.
    *
-   * For in-process harnesses (cc, github-copilot, codex) this reads the
-   * history array held in the corresponding session Map — no I/O.
+   * For in-process harnesses (cc, github-copilot, codex, hermes) this reads
+   * the history array held in the corresponding session Map — no I/O.
    * For opencode this delegates to the injected getOcMessages() which issues
    * an HTTP request to the opencode child process.
    *
@@ -95,6 +97,8 @@ export class HarnessSDK {
         return this._copilot.get(sessionId)?.history ?? [];
       case "codex":
         return this._codex.get(sessionId)?.history ?? [];
+      case "hermes":
+        return this._hermes.get(sessionId)?.history ?? [];
       default:
         return this._getOcMessages(sessionId);
     }

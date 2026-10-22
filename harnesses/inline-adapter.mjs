@@ -231,7 +231,9 @@ function agentRunHarness(agentDef) {
       ? "github-copilot"
       : agentDef.harness === "codex"
         ? "codex"
-        : "opencode";
+        : agentDef.harness === "hermes"
+          ? "hermes"
+          : "opencode";
 }
 
 function latestAssistantText(session) {
@@ -527,6 +529,12 @@ async function callPromptAsync(sessionId, prompt) {
     if (!cs) throw new Error(`callPromptAsync: codex session ${sessionId} not found`);
     return codexRunTurn(cs, prompt);
   }
+  if (harness === "hermes") {
+    const cs = hermesSessions.get(sessionId);
+    if (!cs) throw new Error(`callPromptAsync: hermes session ${sessionId} not found`);
+    const modelId = process.env.HERMES_MODEL || process.env.LITELLM_DEFAULT_MODEL || "claude-sonnet-4-6";
+    return hermesRunTurn(cs, prompt, modelId);
+  }
   // opencode — send via HTTP to the child process
   // Include pinned model so the child doesn't fall back to anthropic/* (the boot_model
   // from /v1/models which resolves to an unavailable model on this account).
@@ -639,16 +647,21 @@ const copilotGlobalBus = new Set(); // SSE response writers
 const codexSessions = new Map(); // id → {id, title, time, history, busSubscribers, activeProcess}
 const codexGlobalBus = new Set(); // SSE response writers
 
+// In-process state for hermes sessions.
+const hermesSessions = new Map(); // id → {id, title, time, history, busSubscribers, activeProcess}
+const hermesGlobalBus = new Set(); // SSE response writers
+
 // Opencode session remap: ourId → current opencode child session id (differs after rehydration).
 const ocSidRemap = new Map();        // ourId → childSid
 const ocSidRemapReverse = new Map(); // childSid → ourId
 
 // Hydrate persisted sessions from SQLite into the in-process Maps.
 {
-  const { cc, copilot, codex } = hydrateFromDb();
+  const { cc, copilot, codex, hermes } = hydrateFromDb();
   for (const [id, s] of cc) { ccSessions.set(id, s); sessionHarness.set(id, "cc"); }
   for (const [id, s] of copilot) { copilotSessions.set(id, s); sessionHarness.set(id, "github-copilot"); }
   for (const [id, s] of codex) { codexSessions.set(id, s); sessionHarness.set(id, "codex"); }
+  for (const [id, s] of hermes) { hermesSessions.set(id, s); sessionHarness.set(id, "hermes"); }
   // Opencode sessions: restore sessionHarness + remap (rehydrated sessions have sdk_session_id set)
   const ocRows = loadOcSessions();
   for (const row of ocRows) {
@@ -658,8 +671,8 @@ const ocSidRemapReverse = new Map(); // childSid → ourId
       ocSidRemapReverse.set(row.sdk_session_id, row.id);
     }
   }
-  const total = cc.size + copilot.size + codex.size + ocRows.length;
-  if (total > 0) log(`hydrated ${total} session(s) from db (cc=${cc.size} copilot=${copilot.size} codex=${codex.size} opencode=${ocRows.length})`);
+  const total = cc.size + copilot.size + codex.size + hermes.size + ocRows.length;
+  if (total > 0) log(`hydrated ${total} session(s) from db (cc=${cc.size} copilot=${copilot.size} codex=${codex.size} hermes=${hermes.size} opencode=${ocRows.length})`);
 }
 
 // (Token cache removed — native auth now handled by @github/copilot-sdk CLI)
@@ -974,6 +987,98 @@ async function codexRunTurn(s, userText) {
   codexEmit(s.id, "message.updated", { info: fullInfo });
   codexEmit(s.id, "session.idle", {});
   log(`codex turn done id=${s.id} chars=${totalText.length}`);
+}
+
+function hermesEmit(sessionId, type, props) {
+  const ev = { id: `evt_${randomUUID().replace(/-/g,"").slice(0,20)}`, type, properties: { ...props, sessionID: sessionId } };
+  const line = `data: ${JSON.stringify(ev)}\n\n`;
+  const s = hermesSessions.get(sessionId);
+  if (s) for (const cb of s.busSubscribers) { try { cb(line); } catch {} }
+  for (const cb of hermesGlobalBus) { try { cb(line); } catch {} }
+}
+
+async function hermesRunTurn(s, userText, modelId) {
+  const startedAt = Date.now();
+
+  // Build context from history for hermes prompt
+  const contextLines = [];
+  for (const msg of s.history) {
+    const role = msg.info.role === "assistant" ? "Assistant" : "User";
+    const text = (msg.parts || []).filter(p => p.type === "text").map(p => p.text).join("\n");
+    if (text) contextLines.push(`${role}: ${text}`);
+  }
+  const fullPrompt = contextLines.length > 0
+    ? `${contextLines.join("\n\n")}\n\nUser: ${userText}`
+    : userText;
+
+  // Record user message
+  const userMsgId = `msg_${randomUUID().replace(/-/g,"").slice(0,20)}`;
+  const userPart = { id: `${userMsgId}_p0`, messageID: userMsgId, type: "text", text: userText };
+  const userMsg = { info: { id: userMsgId, role: "user", time: { created: startedAt, completed: startedAt } }, parts: [userPart] };
+  s.history.push(userMsg);
+  appendMessage(s.id, userMsg, s.history.length - 1);
+  hermesEmit(s.id, "message.updated", { info: userMsg.info });
+  hermesEmit(s.id, "message.part.updated", { messageID: userMsgId, part: userPart });
+
+  const asstMsgId = `msg_${randomUUID().replace(/-/g,"").slice(0,20)}`;
+  const partID = `${asstMsgId}_b0`;
+  let totalText = "";
+  let lastError;
+
+  hermesEmit(s.id, "message.updated", { info: { id: asstMsgId, role: "assistant", time: { created: startedAt } } });
+  hermesEmit(s.id, "message.part.updated", { messageID: asstMsgId, part: { id: partID, messageID: asstMsgId, type: "text", text: "" } });
+
+  try {
+    const litellmBase = process.env.LITELLM_API_BASE;
+    if (!litellmBase) throw new Error("LITELLM_API_BASE not set — hermes requires LiteLLM routing");
+
+    const base = litellmBase.replace(/\/+$/, "");
+    const apiKey = process.env.LITELLM_API_KEY || "";
+    const model = modelId || process.env.HERMES_MODEL || "claude-sonnet-4-6";
+
+    const child = spawn("hermes", ["chat", "--provider", "openai-api", "--model", model, "-q", fullPrompt], {
+      env: {
+        ...process.env,
+        OPENAI_BASE_URL: base,
+        OPENAI_API_KEY: apiKey,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    s.activeProcess = child;
+
+    child.stdout.on("data", (chunk) => {
+      const delta = chunk.toString("utf8");
+      totalText += delta;
+      hermesEmit(s.id, "message.part.delta", { messageID: asstMsgId, partID, field: "text", delta });
+    });
+
+    child.stderr.on("data", (chunk) => {
+      log(`hermes stderr id=${s.id}: ${chunk.toString("utf8").slice(0, 200)}`);
+    });
+
+    await new Promise((resolve, reject) => {
+      child.on("exit", (code) => {
+        s.activeProcess = null;
+        if (code !== 0 && code !== null) reject(new Error(`hermes exited with code ${code}`));
+        else resolve();
+      });
+      child.on("error", reject);
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    lastError = { name: "HermesError", data: { message: msg.slice(0, 500) } };
+    log(`hermes turn error id=${s.id}: ${msg}`);
+  }
+
+  const completedAt = Date.now();
+  const textPart = { id: partID, messageID: asstMsgId, type: "text", text: totalText };
+  const fullInfo = { id: asstMsgId, role: "assistant", time: { created: startedAt, completed: completedAt }, harness: "hermes", modelID: modelId, ...(lastError ? { error: lastError } : { finish: "stop" }) };
+  s.history.push({ info: fullInfo, parts: [textPart] });
+  appendMessage(s.id, { info: fullInfo, parts: [textPart] }, s.history.length - 1);
+  s.time.updated = completedAt;
+  hermesEmit(s.id, "message.updated", { info: fullInfo });
+  hermesEmit(s.id, "session.idle", {});
+  log(`hermes turn done id=${s.id} chars=${totalText.length}`);
 }
 
 function ccEmit(sessionId, type, props) {
@@ -1401,6 +1506,7 @@ const harnessSDK = new HarnessSDK({
   ccSessions,
   copilotSessions,
   codexSessions,
+  hermesSessions,
   getOcMessages,
 });
 
@@ -1972,7 +2078,7 @@ const server = http.createServer(async (req, res) => {
       // opencode (always available) rather than cc, which needs the claude-code
       // SDK to be installed.
       const rawHarness = (savedAgent && savedAgent.base_agent) || (apiAgent && apiAgent.harness) || "opencode";
-      storedBaseAgent = rawHarness === "claude-code" ? "cc" : rawHarness;
+      storedBaseAgent = rawHarness === "claude-code" ? "cc" : rawHarness; // hermes kept as-is
     }
     const resolvedAgent = builtin ?? storedBaseAgent ?? "cc";
     const sessionPlatformAgentId = apiAgentForSession?.id ?? null;
@@ -2023,6 +2129,25 @@ const server = http.createServer(async (req, res) => {
       log(`codex session created id=${id} title=${JSON.stringify(s.title)}`);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ id, title: s.title, time: s.time, agent: "codex", ...(sessionPlatformAgentId ? { agent_id: sessionPlatformAgentId } : {}) }));
+      return;
+    }
+
+    if (resolvedAgent === "hermes") {
+      if (!process.env.LITELLM_API_BASE) {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "hermes requires LITELLM_API_BASE" }));
+        return;
+      }
+      const id = `ses_${randomUUID().replace(/-/g, "").slice(0, 24)}`;
+      const now = Date.now();
+      const s = { id, title: body.title || "New session", time: { created: now }, history: [], busSubscribers: new Set(), activeProcess: null };
+      hermesSessions.set(id, s);
+      sessionAgent.set(id, "hermes");
+      sessionHarness.set(id, "hermes");
+      persistSession({ id, harness: "hermes", title: s.title, createdAt: now, tz: sessionTz, agentId: sessionPlatformAgentId });
+      log(`hermes session created id=${id} title=${JSON.stringify(s.title)}`);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id, title: s.title, time: s.time, agent: "hermes", ...(sessionPlatformAgentId ? { agent_id: sessionPlatformAgentId } : {}) }));
       return;
     }
 
@@ -2105,7 +2230,10 @@ const server = http.createServer(async (req, res) => {
     const codexList = [...codexSessions.values()].map(s => ({
       id: s.id, title: s.title, time: s.time, agent: "codex",
     }));
-    const all = [...tagged, ...dbOcExtra, ...ccList, ...copilotList, ...codexList]
+    const hermesList = [...hermesSessions.values()].map(s => ({
+      id: s.id, title: s.title, time: s.time, agent: "hermes",
+    }));
+    const all = [...tagged, ...dbOcExtra, ...ccList, ...copilotList, ...codexList, ...hermesList]
       .filter(s => s.id != null)
       .sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0));
     res.writeHead(200, { "content-type": "application/json" });
@@ -2138,6 +2266,14 @@ const server = http.createServer(async (req, res) => {
       const agentId = getSessionAgentId(sid);
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ id: cs.id, title: cs.title, time: cs.time, agent: "codex", ...(agentId ? { agent_id: agentId } : {}) }));
+      return;
+    }
+    if (sessionAgent.get(sid) === "hermes") {
+      const cs = hermesSessions.get(sid);
+      if (!cs) { res.writeHead(404, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "not found" })); return; }
+      const agentId = getSessionAgentId(sid);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: cs.id, title: cs.title, time: cs.time, agent: "hermes", ...(agentId ? { agent_id: agentId } : {}) }));
       return;
     }
     // opencode: proxy, fall back to SQLite metadata when child doesn't know the session
@@ -2213,6 +2349,27 @@ const server = http.createServer(async (req, res) => {
         log(`codex prompt_async id=${sid}`);
         res.writeHead(204); res.end();
         codexRunTurn(cs, text).catch(e => log(`codex runTurn error id=${sid}:`, e.message));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(cs.history)); return;
+    }
+
+    // Route hermes sessions in-process
+    if (sid && sessionAgent.get(sid) === "hermes") {
+      const cs = hermesSessions.get(sid);
+      if (!cs) { res.writeHead(404, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "session not found" })); return; }
+
+      if (p.endsWith("/prompt_async")) {
+        let body = {};
+        try { body = JSON.parse(raw || "{}"); } catch {}
+        const text = Array.isArray(body.parts) ? body.parts.filter(p => p.type === "text").map(p => p.text).join("\n") : (body.text ?? "");
+        if (await tryPlugin(text, sid, "hermes", res)) return;
+        const rawModel = body.model?.modelID ?? (process.env.HERMES_MODEL || process.env.LITELLM_DEFAULT_MODEL || "claude-sonnet-4-6");
+        const modelId = rawModel.includes("/") ? rawModel.slice(rawModel.indexOf("/") + 1) : rawModel;
+        if (!text.trim()) { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "no text" })); return; }
+        log(`hermes prompt_async id=${sid} model=${modelId}`);
+        res.writeHead(204); res.end();
+        hermesRunTurn(cs, text, modelId).catch(e => log(`hermes runTurn error id=${sid}:`, e.message));
         return;
       }
       res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(cs.history)); return;
@@ -2338,6 +2495,13 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(cs.history));
       return;
     }
+    if (sessionAgent.get(sid) === "hermes") {
+      const cs = hermesSessions.get(sid);
+      if (!cs) { res.writeHead(404, { "content-type": "application/json" }); res.end(JSON.stringify({ error: "session not found" })); return; }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(cs.history));
+      return;
+    }
     // opencode: try child, fall back to our DB for lost sessions
     if (sessionHarness.get(sid) === "opencode") {
       const childSid = ocSidRemap.get(sid) ?? sid;
@@ -2367,19 +2531,22 @@ const server = http.createServer(async (req, res) => {
     copilotGlobalBus.add(copilotPush);
     const codexPush = (line) => { try { res.write(line); } catch {} };
     codexGlobalBus.add(codexPush);
+    const hermesPush = (line) => { try { res.write(line); } catch {} };
+    hermesGlobalBus.add(hermesPush);
     const pluginPush = (line) => { try { res.write(line); } catch {} };
     pluginGlobalBus.add(pluginPush);
 
     const ocReq = http.get(UP + "/event", (ocRes) => {
       ocRes.on("data", (chunk) => { tapOcSseChunk(chunk); try { res.write(translateOcChunk(chunk)); } catch {} });
-      ocRes.on("end", () => { ccGlobalBus.delete(ccPush); copilotGlobalBus.delete(copilotPush); codexGlobalBus.delete(codexPush); pluginGlobalBus.delete(pluginPush); try { res.end(); } catch {} });
+      ocRes.on("end", () => { ccGlobalBus.delete(ccPush); copilotGlobalBus.delete(copilotPush); codexGlobalBus.delete(codexPush); hermesGlobalBus.delete(hermesPush); pluginGlobalBus.delete(pluginPush); try { res.end(); } catch {} });
     });
-    ocReq.on("error", () => { ccGlobalBus.delete(ccPush); copilotGlobalBus.delete(copilotPush); codexGlobalBus.delete(codexPush); pluginGlobalBus.delete(pluginPush); try { res.end(); } catch {} });
+    ocReq.on("error", () => { ccGlobalBus.delete(ccPush); copilotGlobalBus.delete(copilotPush); codexGlobalBus.delete(codexPush); hermesGlobalBus.delete(hermesPush); pluginGlobalBus.delete(pluginPush); try { res.end(); } catch {} });
 
     req.on("close", () => {
       ccGlobalBus.delete(ccPush);
       copilotGlobalBus.delete(copilotPush);
       codexGlobalBus.delete(codexPush);
+      hermesGlobalBus.delete(hermesPush);
       pluginGlobalBus.delete(pluginPush);
       ocReq.destroy();
     });
@@ -2429,6 +2596,12 @@ const server = http.createServer(async (req, res) => {
     if (harness === "codex") {
       const cs = codexSessions.get(sid);
       if (cs?.activeProcess) { cs.activeProcess.kill("SIGTERM"); cs.activeProcess = null; log(`abort: codex sid=${sid}`); }
+      res.writeHead(204); res.end();
+      return;
+    }
+    if (harness === "hermes") {
+      const cs = hermesSessions.get(sid);
+      if (cs?.activeProcess) { cs.activeProcess.kill("SIGTERM"); cs.activeProcess = null; log(`abort: hermes sid=${sid}`); }
       res.writeHead(204); res.end();
       return;
     }
